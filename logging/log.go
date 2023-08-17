@@ -1,4 +1,4 @@
-package main
+package logging
 
 import (
 	"context"
@@ -45,6 +45,7 @@ func (t logrusTraceHook) Fire(entry *logrus.Entry) error {
 		}
 		if sCtx.HasSpanID() {
 			entry.Data["spanId"] = sCtx.SpanID().String()
+
 		}
 	}
 
