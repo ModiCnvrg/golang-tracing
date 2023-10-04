@@ -18,6 +18,7 @@ package otelconfluent
 
 import (
 	"context"
+	"github.com/sirupsen/logrus"
 	"opetelemetry-and-go/logging"
 	"time"
 
@@ -58,8 +59,7 @@ func NewConsumerWithTracing(consumer *kafka.Consumer, opts ...Option) *Consumer 
 			cfg.tracerName,
 			oteltrace.WithInstrumentationVersion(contrib.SemVersion()),
 		),
-		propagator:      cfg.propagator,
-		consumerGroupID: cfg.consumerGroupID,
+		propagator: cfg.propagator,
 	}
 }
 
@@ -84,25 +84,16 @@ func (c *Consumer) attrsByOperationAndMessage(operation internal.Operation, msg 
 	return attributes
 }
 
-func (c *Consumer) startSpan(operationName internal.Operation, msg *kafka.Message) (context.Context, oteltrace.Span) {
+func (c *Consumer) StartSpan(operationName internal.Operation, msg *kafka.Message) (context.Context, oteltrace.Span) {
 	opts := []oteltrace.SpanStartOption{
 		oteltrace.WithSpanKind(oteltrace.SpanKindConsumer),
 	}
 
 	carrier := NewMessageCarrier(msg)
 	ctx := c.propagator.Extract(context.Background(), carrier)
-	log1 := logging.NewLogrus(ctx)
-	log1.Info("message 1")
-
 	ctx, span := c.tracer.Start(ctx, string(operationName), opts...)
-	log2 := logging.NewLogrus(ctx)
-	log2.Info("message 2")
-
 	c.propagator.Inject(ctx, carrier)
-	log3 := logging.NewLogrus(ctx)
-	log3.Info("message 3")
 	span.SetAttributes(c.attrsByOperationAndMessage(operationName, msg)...)
-
 	return ctx, span
 }
 
@@ -111,7 +102,7 @@ func (c *Consumer) ReadMessage(timeout time.Duration) (*kafka.Message, error) {
 	msg, err := c.Consumer.ReadMessage(timeout)
 
 	if msg != nil {
-		_, s := c.startSpan(internal.OperationConsume, msg)
+		_, s := c.StartSpan(internal.OperationConsume, msg)
 		endSpan(s, err)
 	}
 
@@ -123,8 +114,7 @@ func (c *Consumer) ReadMessageWithHandler(timeout time.Duration, handler Consume
 	msg, err := c.Consumer.ReadMessage(timeout)
 
 	if msg != nil {
-		ctx, s := c.startSpan(internal.OperationConsume, msg)
-		logging.NewLogrus(ctx)
+		ctx, s := c.StartSpan(internal.OperationConsume, msg)
 		err = handler(ctx, c.Consumer, msg)
 		endSpan(s, err)
 	}
@@ -141,7 +131,7 @@ func (c *Consumer) Poll(timeoutMs int) kafka.Event {
 	case *kafka.Message:
 		msg := ev
 		if msg != nil {
-			_, s := c.startSpan(internal.OperationConsume, msg)
+			_, s := c.StartSpan(internal.OperationConsume, msg)
 			endSpan(s, nil)
 		}
 	}
@@ -152,16 +142,28 @@ func (c *Consumer) Poll(timeoutMs int) kafka.Event {
 // PollWithHandler retrieves an event from current consumer, creates a new span
 // if it is a kafka.Message event type and also runs the given handler.
 func (c *Consumer) PollWithHandler(timeoutMs int, handler ConsumeFunc) kafka.Event {
+	logger := logging.NewLogrus(context.Background()).WithFields(logrus.Fields{
+		"component": "service A",
+	})
 	event := c.Consumer.Poll(timeoutMs)
 
 	switch ev := event.(type) {
 	case *kafka.Message:
 		msg := ev
 		if msg != nil {
-			ctx, s := c.startSpan(internal.OperationConsume, msg)
+			ctx, s := c.StartSpan(internal.OperationConsume, msg)
 			err := handler(ctx, c.Consumer, msg)
 			endSpan(s, err)
 		}
+	case kafka.Error:
+		// Errors should generally be considered
+		// informational, the client will try to
+		// automatically recover.
+		// But in this example we choose to terminate
+		// the application if all brokers are down.
+		logger.Errorf("%% Error: %v: %v\n", ev.Code(), ev)
+	default:
+		logger.Warnf("Ignored %v\n", ev)
 	}
 
 	return event

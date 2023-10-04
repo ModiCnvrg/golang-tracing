@@ -4,16 +4,19 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"flag"
 	"fmt"
+	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"google.golang.org/grpc/credentials"
+	"log"
 	"net/http"
 	"opetelemetry-and-go/logging"
-	kafkaProducer "opetelemetry-and-go/producer"
+	"opetelemetry-and-go/otelconfluent"
 	"os"
 	"time"
 
@@ -27,42 +30,111 @@ import (
 	sdkTrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 	"go.opentelemetry.io/otel/trace"
-	"opetelemetry-and-go/kafkaConsumer"
 )
 
-const (
-	serviceName = "AdderSvc"
+var (
+	brokers       = *flag.String("brokers", "localhost:9092", "The Kafka bootstrap servers to connect to, as a comma separated list")
+	kafkaProducer *otelconfluent.Producer
 )
-
-var tp trace.TracerProvider
 
 func main() {
 	ctx := context.Background()
 	{
-		tp, err := setupTracing(ctx, serviceName)
+		var tp trace.TracerProvider
+		var err error
+		tp, err = setupTracing(ctx, "kafka - producer - Service A")
 		if err != nil {
 			panic(err)
 		}
-		defer tp.Shutdown(ctx)
+		kafkaProducer = InitProducer(tp)
 
-		mp, err := setupMetrics(ctx, serviceName)
+		mp, err := setupMetrics(ctx, "Adder Service")
 		if err != nil {
 			panic(err)
 		}
 		defer mp.Shutdown(ctx)
 	}
+	{
+		var tp trace.TracerProvider
+		var err error
+		tp, err = setupTracing(ctx, "kafka - consumer")
+		if err != nil {
+			panic(err)
+		}
 
+		go InitConsumer(tp)
+	}
 	go serviceA(ctx, 8081)
 	serviceB(ctx, 8082)
+}
+
+func InitConsumer(tp trace.TracerProvider) {
+	flag.Parse()
+
+	// Initialize an original Kafka consumer.
+	confluentConsumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers":  brokers,
+		"group.id":           "example",
+		"enable.auto.commit": false,
+		"auto.offset.reset":  "earliest",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Initialize OpenTelemetry trace provider and wrap the original kafka consumer.
+	consumer := otelconfluent.NewConsumerWithTracing(confluentConsumer, otelconfluent.WithTracerProvider(tp))
+	defer func() { _ = consumer.Close() }()
+
+	// Subscribe consumer to topic.
+	if err := consumer.Subscribe(otelconfluent.KafkaTopic, nil); err != nil {
+		log.Fatal(err)
+	}
+
+	handler := func(ctx context.Context, consumer *kafka.Consumer, msg *kafka.Message) error {
+		log := logging.NewLogrus(ctx)
+		log.Info("message received with key: " + string(msg.Key))
+		return nil
+	}
+
+	// Read one message from the topic.
+	for {
+		event := consumer.PollWithHandler(10*1000, handler)
+		log.Println(event)
+	}
+
+	// Or you can still use the ReadMessage(timeout) or Poll(timeoutMs) methods but you will not
+	// be able to obtain the right handling duration because they will only return the Kafka message to you.
+	//
+	// msg, err := consumer.ReadMessage(10*time.Second)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	//
+	// println("message received with key: " + string(msg.Key))
+}
+
+func InitProducer(tp trace.TracerProvider) *otelconfluent.Producer {
+	flag.Parse()
+
+	// Initialize an original Kafka producer.
+	confluentProducer, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers": brokers,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	// Initialize OpenTelemetry trace provider and wrap the original kafka producer.
+	producer := otelconfluent.NewProducerWithTracing(confluentProducer, otelconfluent.WithTracerProvider(tp))
+	return producer
 }
 
 // curl -vkL http://127.0.0.1:8081/serviceA
 func serviceA(ctx context.Context, port int) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/serviceA", serviceA_HttpHandler)
-	handler := otelhttp.NewHandler(mux, "server A.http")
-	serverPort := fmt.Sprintf(":%d", port)
-	server := &http.Server{Addr: serverPort, Handler: handler}
+	server := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: otelhttp.NewHandler(mux, "server A.http middleware")}
 
 	fmt.Println("serviceA listening on", server.Addr)
 	if err := server.ListenAndServe(); err != nil {
@@ -71,22 +143,33 @@ func serviceA(ctx context.Context, port int) {
 }
 
 func serviceA_HttpHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, span := otel.Tracer("myTracer").Start(r.Context(), "serviceA_HttpHandler")
+	ctx, span := otel.Tracer("myTracer").Start(r.Context(), fmt.Sprintf("%s %s", r.Method, r.RequestURI))
 	log := logging.NewLogrus(ctx).WithFields(logrus.Fields{
 		"component": "service A",
-		"age":       89,
 	})
 	log.Info("serviceA_HttpHandler_called")
 	defer span.End()
 
-	cli := &http.Client{
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	// Create a kafka message and produce it in topic.
+	msg := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &otelconfluent.KafkaTopic},
+		Key:            []byte("test-key"),
+		Value:          []byte("test-value"),
 	}
-	kafkaProducer.InitProducer(ctx, tp)
-	go kafkaConsumer.InitConsumer(tp)
+
+	if err := kafkaProducer.Produce(ctx, msg, nil); err != nil {
+		log.Fatal(err)
+	}
+
+	//kafkaProducer.Flush(5000)
+
+	log.Infof("message sent with key: " + string(msg.Key))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8082/serviceB", nil)
 	if err != nil {
 		panic(err)
+	}
+	cli := &http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 	resp, err := cli.Do(req)
 	if err != nil {
@@ -110,55 +193,51 @@ func serviceB(ctx context.Context, port int) {
 }
 
 func serviceB_HttpHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, span := otel.Tracer("myTracer").Start(r.Context(), "serviceB_HttpHandler")
+	ctx, span := otel.Tracer("myTracer").Start(r.Context(), fmt.Sprintf("%s %s", r.Method, r.RequestURI))
 	log := logging.NewLogrus(ctx).WithFields(logrus.Fields{
-		"component": "service B",
-		"age":       89,
-	})
+		"component": "service B"})
 	log.Info("serviceB_HttpHandler_called")
 	defer span.End()
+	add := func(ctx context.Context, x, y int64) int64 {
+		ctx, span := otel.Tracer("myTracer").Start(
+			ctx,
+			"add",
+			// add labels/tags/resources(if any) that are specific to this scope.
+			trace.WithAttributes(attribute.String("component", "addition")),
+			trace.WithAttributes(attribute.String("someKey", "someValue")),
+			trace.WithAttributes(attribute.Int("age", 89)),
+		)
+		defer span.End()
+
+		counter, _ := global.MeterProvider().
+			Meter(
+				"instrumentation/package/name",
+				metric.WithInstrumentationVersion("0.0.1"),
+			).
+			Int64Counter(
+				"add_counter",
+				instrument.WithDescription("how many times add function has been called."),
+			)
+		counter.Add(
+			ctx,
+			1,
+			// labels/tags
+			attribute.String("component", "addition"),
+			attribute.Int("age", 89),
+		)
+
+		log := logging.NewLogrus(ctx).WithFields(logrus.Fields{
+			"component": "addition",
+			"age":       89,
+		})
+		log.Info("add_called")
+
+		return x + y
+	}
 
 	answer := add(ctx, 42, 1813)
 	w.Header().Add("SVC-RESPONSE", fmt.Sprint(answer))
-	fmt.Fprintf(w, "hello from serviceB: Answer is: %d", answer)
 	log.Info("hello from serviceB: Answer is: %d", answer)
-}
-
-func add(ctx context.Context, x, y int64) int64 {
-	ctx, span := otel.Tracer("myTracer").Start(
-		ctx,
-		"add",
-		// add labels/tags/resources(if any) that are specific to this scope.
-		trace.WithAttributes(attribute.String("component", "addition")),
-		trace.WithAttributes(attribute.String("someKey", "someValue")),
-		trace.WithAttributes(attribute.Int("age", 89)),
-	)
-	defer span.End()
-
-	counter, _ := global.MeterProvider().
-		Meter(
-			"instrumentation/package/name",
-			metric.WithInstrumentationVersion("0.0.1"),
-		).
-		Int64Counter(
-			"add_counter",
-			instrument.WithDescription("how many times add function has been called."),
-		)
-	counter.Add(
-		ctx,
-		1,
-		// labels/tags
-		attribute.String("component", "addition"),
-		attribute.Int("age", 89),
-	)
-
-	log := logging.NewLogrus(ctx).WithFields(logrus.Fields{
-		"component": "addition",
-		"age":       89,
-	})
-	log.Info("add_called")
-
-	return x + y
 }
 
 func setupTracing(ctx context.Context, serviceName string) (*sdkTrace.TracerProvider, error) {
