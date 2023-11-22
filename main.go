@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"flag"
 	"fmt"
-	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -14,21 +12,21 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/propagation"
+	_ "go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
-	sdkTrace "go.opentelemetry.io/otel/sdk/trace"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/credentials"
 	"log"
 	"opetelemetry-and-go/logging"
-	"opetelemetry-and-go/otelconfluent"
 	"os"
+	"time"
 )
 
-var (
-	brokers       = *flag.String("brokers", "localhost:9092", "The Kafka bootstrap servers to connect to, as a comma separated list")
-	kafkaProducer *otelconfluent.Producer
+const (
+	cxApplicationName = "observability-poc"
+	cxSubsystemName   = "instrumentation-traces"
 )
 
 func getEnv(key, fallback string) string {
@@ -41,89 +39,16 @@ func getEnv(key, fallback string) string {
 
 func main() {
 	ctx := context.Background()
-	{
-		var tp trace.TracerProvider
-		var err error
-		tp, err = setupTracing(ctx, "Service A Trace Provider")
-		if err != nil {
-			panic(err)
-		}
-		kafkaProducer = InitProducer(tp)
-	}
-	{
-		var tp trace.TracerProvider
-		var err error
-		tp, err = setupTracing(ctx, "Service A Trace Provider")
-		if err != nil {
-			panic(err)
-		}
-
-		go InitConsumer(tp)
-	}
 	go serviceA(ctx, 8081)
+	//go func() {
+	//	for {
+	//		ctx, _ := otel.Tracer("myTracer").Start(ctx, "")
+	//		time.Sleep(2 * time.Second)
+	//		log := logging.NewLogrus(ctx)
+	//		log.Info("just printing")
+	//	}
+	//}
 	serviceB(ctx, 8082)
-}
-
-func InitConsumer(tp trace.TracerProvider) {
-	flag.Parse()
-
-	// Initialize an original Kafka consumer.
-	confluentConsumer, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":  brokers,
-		"group.id":           "example",
-		"enable.auto.commit": false,
-		"auto.offset.reset":  "earliest",
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Initialize OpenTelemetry trace provider and wrap the original kafka consumer.
-	consumer := otelconfluent.NewConsumerWithTracing(confluentConsumer, otelconfluent.WithTracerProvider(tp))
-	defer func() { _ = consumer.Close() }()
-
-	// Subscribe consumer to topic.
-	if err := consumer.Subscribe(otelconfluent.KafkaTopic, nil); err != nil {
-		log.Fatal(err)
-	}
-
-	handler := func(ctx context.Context, consumer *kafka.Consumer, msg *kafka.Message) error {
-		log := logging.NewLogrus(ctx)
-		log.Info("message received with key: " + string(msg.Key))
-		return nil
-	}
-
-	// Read one message from the topic.
-	for {
-		event := consumer.PollWithHandler(10*1000, handler)
-		log.Println(event)
-	}
-
-	// Or you can still use the ReadMessage(timeout) or Poll(timeoutMs) methods but you will not
-	// be able to obtain the right handling duration because they will only return the Kafka message to you.
-	//
-	// msg, err := consumer.ReadMessage(10*time.Second)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	//
-	// println("message received with key: " + string(msg.Key))
-}
-
-func InitProducer(tp trace.TracerProvider) *otelconfluent.Producer {
-	flag.Parse()
-
-	// Initialize an original Kafka producer.
-	confluentProducer, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": brokers,
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	// Initialize OpenTelemetry trace provider and wrap the original kafka producer.
-	producer := otelconfluent.NewProducerWithTracing(confluentProducer, otelconfluent.WithTracerProvider(tp))
-	return producer
 }
 
 // curl -vkL http://127.0.0.1:8081/serviceA
@@ -138,7 +63,7 @@ func serviceA(ctx context.Context, port int) {
 	r.Use(otelgin.Middleware("service A", otelgin.WithTracerProvider(tp)))
 	r.GET("/serviceA", serviceA_HttpHandler)
 	fmt.Println("serviceA listening on", r.BasePath())
-	host := "localhost"
+	host := "0.0.0.0"
 	hostAddress := fmt.Sprintf("%s:%d", host, port)
 	err = r.Run(hostAddress)
 	if err != nil {
@@ -147,27 +72,17 @@ func serviceA(ctx context.Context, port int) {
 }
 
 func serviceA_HttpHandler(c *gin.Context) {
+	//r := c.Request
 	ctx, span := otel.Tracer("myTracer").Start(c.Request.Context(), fmt.Sprintf("%s %s", c.Request.Method, c.Request.RequestURI))
+	span.SetAttributes(
+		attribute.String("span.kind", "server"),
+	)
 	log := logging.NewLogrus(ctx).WithFields(logrus.Fields{
 		"component": "service A",
 	})
 	log.Info("serviceA_HttpHandler_called")
 	defer span.End()
 
-	// Create a kafka message and produce it in topic.
-	msg := &kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &otelconfluent.KafkaTopic},
-		Key:            []byte("test-key"),
-		Value:          []byte("test-value"),
-	}
-
-	if err := kafkaProducer.Produce(ctx, msg, nil); err != nil {
-		log.Fatal(err)
-	}
-
-	//kafkaProducer.Flush(5000)
-
-	log.Infof("message sent with key: " + string(msg.Key))
 	resp, err := otelhttp.Get(c.Request.Context(), "http://localhost:8082/serviceB")
 
 	if err != nil {
@@ -189,7 +104,7 @@ func serviceB(ctx context.Context, port int) {
 	r.Use(otelgin.Middleware("service B", otelgin.WithTracerProvider(tp)))
 	r.GET("/serviceB", serviceB_HttpHandler)
 	fmt.Println("serviceB listening on", r.BasePath())
-	host := "localhost"
+	host := "0.0.0.0"
 	hostAddress := fmt.Sprintf("%s:%d", host, port)
 	err = r.Run(hostAddress)
 	if err != nil {
@@ -199,8 +114,7 @@ func serviceB(ctx context.Context, port int) {
 
 func serviceB_HttpHandler(c *gin.Context) {
 	ctx, span := otel.Tracer("myTracer").Start(c.Request.Context(), fmt.Sprintf("%s %s", c.Request.Method, c.Request.RequestURI))
-	log := logging.NewLogrus(ctx).WithFields(logrus.Fields{
-		"component": "service B"})
+	log := logging.NewLogrus(ctx).WithFields(logrus.Fields{"component": "service B"})
 	log.Info("serviceB_HttpHandler_called")
 	for k, vals := range c.Request.Header {
 		log.Infof("%s", k)
@@ -235,47 +149,54 @@ func serviceB_HttpHandler(c *gin.Context) {
 	log.Info("hello from serviceB: Answer is: %d", answer)
 }
 
-func setupTracing(ctx context.Context, serviceName string) (*sdkTrace.TracerProvider, error) {
-	c, err := getTls()
-	if err != nil {
-		return nil, err
+func setupTracing(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
+	// 1. define trace connection options
+	var headers = map[string]string{
+		"Authorization": "Bearer " + os.Getenv("CX_TOKEN"),
+	}
+	tracesCollectorEndpoint := getEnv("traces-collector-addr", "ingress.coralogix.us:443")
+
+	traceConnOpts := []otlptracegrpc.Option{
+		otlptracegrpc.WithTimeout(1 * time.Second),
+		otlptracegrpc.WithEndpoint(tracesCollectorEndpoint),
+		otlptracegrpc.WithHeaders(headers),
+		otlptracegrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})),
 	}
 
-	exporter, err := otlptracegrpc.New(
-		ctx,
-		otlptracegrpc.WithEndpoint("localhost:4317"),
-		otlptracegrpc.WithTLSCredentials(
-			// mutual tls.
-			credentials.NewTLS(c),
-		),
-	)
+	// 2. set up a trace exporter
+	exporter, err := otlptracegrpc.New(ctx, traceConnOpts...)
 	if err != nil {
-		return nil, err
+		log.Fatalf("failed to create trace exporter: %v", err)
 	}
 
-	// labels/tags/resources that are common to all traces.
+	// 3 define span resource attributes,
+	// these resource attributes will be added to all Spans
 	resource := resource.NewWithAttributes(
 		semconv.SchemaURL,
-		semconv.ServiceNameKey.String(serviceName),
-		attribute.String("some-attribute", "some-value"),
+		semconv.ServiceNameKey.String("go-manual-instro-traces-example"),
+
+		// cx.application.name and cx.subsystem.name are required for the
+		// spans being sent to the coralogix platform
+		attribute.String("cx.application.name", cxApplicationName),
+		attribute.String("cx.subsystem.name", cxSubsystemName),
 	)
 
-	provider := sdkTrace.NewTracerProvider(
-		sdkTrace.WithBatcher(exporter),
-		sdkTrace.WithResource(resource),
-		// set the sampling rate based on the parent span to 60%
-		sdkTrace.WithSampler(sdkTrace.ParentBased(sdkTrace.TraceIDRatioBased(1))),
+	// 4. create batch span processor
+	//      Note: SpanProcessor is a processing pipeline for spans in the trace signal.
+	//      SpanProcessors registered with a TracerProvider and are called at the start and end of a
+	//      Span's lifecycle, and are called in the order they are registered.
+	//      https://pkg.go.dev/go.opentelemetry.io/otel/sdk/trace#SpanProcessor
+	sp := sdktrace.NewSimpleSpanProcessor(exporter)
+
+	// 5. add span processor and resource attributes to the trace provider
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(resource),
+		sdktrace.WithSpanProcessor(sp),
 	)
 
-	otel.SetTracerProvider(provider)
-
-	otel.SetTextMapPropagator(
-		propagation.NewCompositeTextMapPropagator(
-			propagation.TraceContext{}, // W3C Trace Context format; https://www.w3.org/TR/trace-context/
-		),
-	)
-
-	return provider, nil
+	// 6. set the global trace provider
+	otel.SetTracerProvider(tp)
+	return tp, nil
 }
 
 // getTls returns a configuration that enables the use of mutual TLS.

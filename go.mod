@@ -1,6 +1,6 @@
 module opetelemetry-and-go
 
-go 1.20
+go 1.21
 
 require (
 	github.com/confluentinc/confluent-kafka-go v1.9.2

@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracing-poc-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tracing-poc
+  template:
+    metadata:
+      labels:
+        app: tracing-poc
+    spec:
+      containers:
+        - name: tracing-poc
+          image: tracing-poc-3
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8081
+          env:
+            - name: traces-collector-addr
+              value: "ingress.coralogix.us:443"
+            - name:
