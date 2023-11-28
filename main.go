@@ -30,24 +30,28 @@ const (
 )
 
 func getEnv(key, fallback string) string {
+	log := logging.NewLogrus(context.Background())
 	value, exists := os.LookupEnv(key)
 	if !exists {
 		value = fallback
+		log.Infof("returning falback value %v for key %v", fallback, key)
 	}
+	log.Infof("returning value %v for key %v", value, key)
 	return value
 }
 
 func main() {
 	ctx := context.Background()
 	go serviceA(ctx, 8081)
-	//go func() {
-	//	for {
-	//		ctx, _ := otel.Tracer("myTracer").Start(ctx, "")
-	//		time.Sleep(2 * time.Second)
-	//		log := logging.NewLogrus(ctx)
-	//		log.Info("just printing")
-	//	}
-	//}
+	go func() {
+		for {
+			ctx, span := otel.Tracer("myTracer").Start(ctx, "")
+			time.Sleep(2 * time.Second)
+			log := logging.NewLogrus(ctx)
+			log.Info("just printing")
+			span.End()
+		}
+	}()
 	serviceB(ctx, 8082)
 }
 
@@ -151,16 +155,21 @@ func serviceB_HttpHandler(c *gin.Context) {
 
 func setupTracing(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
 	// 1. define trace connection options
-	var headers = map[string]string{
-		"Authorization": "Bearer " + os.Getenv("CX_TOKEN"),
-	}
+
 	tracesCollectorEndpoint := getEnv("traces-collector-addr", "ingress.coralogix.us:443")
 
 	traceConnOpts := []otlptracegrpc.Option{
 		otlptracegrpc.WithTimeout(1 * time.Second),
 		otlptracegrpc.WithEndpoint(tracesCollectorEndpoint),
-		otlptracegrpc.WithHeaders(headers),
-		otlptracegrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})),
+	}
+
+	if token := getEnv("CX_TOKEN", ""); token != "" {
+		var headers = map[string]string{
+			"Authorization": "Bearer " + os.Getenv("CX_TOKEN"),
+		}
+		traceConnOpts = append(traceConnOpts, otlptracegrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})), otlptracegrpc.WithHeaders(headers))
+	} else {
+		traceConnOpts = append(traceConnOpts, otlptracegrpc.WithInsecure())
 	}
 
 	// 2. set up a trace exporter

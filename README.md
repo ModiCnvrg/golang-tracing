@@ -1,13 +1,13 @@
 # Installing Coralogix:
 # Create secret:
 kubectl create secret generic coralogix-keys \
--n monitoring \
---from-literal=PRIVATE_KEY=<send-your-data-API-key>
+--from-literal=PRIVATE_KEY=<send-your-data-API-key> \
+-n monitoring
 
 # Helm
 helm repo add coralogix https://cgx.jfrog.io/artifactory/coralogix-charts-virtual
-kubectl create secret generic coralogix-keys --from-literal=PRIVATE_KEY="cxtp_oxXp9dX3lPQ4vY3qM4HlqH7eZowc37"
-helm upgrade --install otel-coralogix-integration coralogix/otel-integration --render-subchart-notes -f 
+kubectl create secret generic coralogix-keys --from-literal=PRIVATE_KEY="" -n monitoring
+helm upgrade --install otel-coralogix-integration coralogix/otel-integration --render-subchart-notes --create-namespace -n monitoring -f 
 
 # Uninstall
 helm uninstall otel-coralogix-integration
@@ -22,5 +22,11 @@ minikube image load tracing-poc
 helm upgrade --install prometheus-coralogix coralogix-charts-virtual/prometheus-operator-coralogix \
 -f prom-override.yaml \
 --namespace=monitoring
+
+# Building the image:
+docker buildx build --platform linux/amd64 -t modicnvrg/observability-poc:latest .
+
+# Pushing to registry:
+docker push modicnvrg/observability-poc:latest
 
 

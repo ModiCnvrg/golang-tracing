@@ -1,13 +1,21 @@
 global:
-  domain: "coralogix.us"
-  clusterName: "aks-cicd-2546"
-  defaultApplicationName: "aks-cicd-2546-defaultApplicationName"
-  defaultSubsystemName: "aks-cicd-2546-defaultSubsystemName"
-  logLevel: "info"
+  domain: ""
+  clusterName: ""
+  defaultApplicationName: "default"
+  defaultSubsystemName: "nodes"
+  fullnameOverride: otel-coralogix
 
-  extensions:
-    kubernetesDashboard:
-      enabled: true
+  # Old endpoint based configuration,
+  # please use domain instead.
+  traces:
+    endpoint: ""
+  metrics:
+    endpoint: ""
+  logs:
+    endpoint: ""
+
+# set distribution to openshift for openshift clusters
+distribution: ""
 opentelemetry-collector:
   mode: daemonset
   serviceAccount:
@@ -31,10 +39,10 @@ opentelemetry-collector:
       storeCheckpoints: true
       maxRecombineLogSize: 1048576
       extraFilelogOperators: []
-    #     - type: recombine
-    #       combine_field: body
-    #       source_identifier: attributes["log.file.path"]
-    #       is_first_entry: body matches "^(YOUR-LOGS-REGEX)"
+#     - type: recombine
+#       combine_field: body
+#       source_identifier: attributes["log.file.path"]
+#       is_first_entry: body matches "^(YOUR-LOGS-REGEX)"
     kubernetesAttributes:
       enabled: true
     hostMetrics:
@@ -47,18 +55,18 @@ opentelemetry-collector:
       integrationName: "coralogix-otel-agent-helm"
 
   extraEnvs:
-    - name: CORALOGIX_PRIVATE_KEY
-      valueFrom:
-        secretKeyRef:
-          name: coralogix-keys
-          key: PRIVATE_KEY
-    - name: OTEL_RESOURCE_ATTRIBUTES
-      value: "k8s.node.name=$(K8S_NODE_NAME)"
-    - name: KUBE_NODE_NAME
-      valueFrom:
-        fieldRef:
-          apiVersion: v1
-          fieldPath: spec.nodeName
+  - name: CORALOGIX_PRIVATE_KEY
+    valueFrom:
+      secretKeyRef:
+        name: coralogix-keys
+        key: PRIVATE_KEY
+  - name: OTEL_RESOURCE_ATTRIBUTES
+    value: "k8s.node.name=$(K8S_NODE_NAME)"
+  - name: KUBE_NODE_NAME
+    valueFrom:
+      fieldRef:
+        apiVersion: v1
+        fieldPath: spec.nodeName
   config:
     extensions:
       zpages:
@@ -77,24 +85,17 @@ opentelemetry-collector:
         logs:
           endpoint: "{{ .Values.global.logs.endpoint }}"
         application_name_attributes:
-          - "k8s.namespace.name"
-          - "service.namespace"
+        - "k8s.namespace.name"
+        - "service.namespace"
         subsystem_name_attributes:
-          - "k8s.deployment.name"
-          - "k8s.statefulset.name"
-          - "k8s.daemonset.name"
-          - "k8s.cronjob.name"
-          - "service.name"
+        - "k8s.deployment.name"
+        - "k8s.statefulset.name"
+        - "k8s.daemonset.name"
+        - "k8s.cronjob.name"
+        - "service.name"
         application_name: "{{.Values.global.defaultApplicationName }}"
         subsystem_name: "{{.Values.global.defaultSubsystemName }}"
     processors:
-      filter/filter_log:
-        logs:
-          include:
-            match_type: regexp
-            resource_attributes:
-              - key: host.name
-                value: aks.*
       k8sattributes:
         filter:
           node_from_env_var: KUBE_NODE_NAME
@@ -125,7 +126,6 @@ opentelemetry-collector:
           - name: "k8s.container.name"
           - name: "k8s.node.name"
           - name: "k8s.namespace.name"
-
     receivers:
       otlp:
         protocols:
@@ -155,10 +155,10 @@ opentelemetry-collector:
                     - ${MY_POD_IP}:8888
     service:
       extensions:
-        - zpages
-        - pprof
-        - health_check
-        - memory_ballast
+      - zpages
+      - pprof
+      - health_check
+      - memory_ballast
       telemetry:
         logs:
           encoding: json
@@ -190,7 +190,6 @@ opentelemetry-collector:
           exporters:
             - coralogix
           processors:
-            - filter/filter_log
             - batch
           receivers:
             - otlp

@@ -1,24 +1,32 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: tracing-poc-deployment
+  name: obsrv
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: tracing-poc
+      app: obsrv-poc
   template:
     metadata:
       labels:
-        app: tracing-poc
+        app: obsrv-poc
     spec:
       containers:
-        - name: tracing-poc
-          image: tracing-poc-3
-          imagePullPolicy: Never
+        - name: obsrv-poc
+          image: modicnvrg/observability-poc:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8081
           env:
+#            - name: CX_TOKEN
+#              value: cxtp_oxXp9dX3lPQ4vY3qM4HlqH7eZowc37
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             - name: traces-collector-addr
-              value: "ingress.coralogix.us:443"
-            - name:
+              value: $(NODE_IP):4317
+#            - name: NODE_IP
+#              valueFrom:
+#                fieldRef: status.hostIP
