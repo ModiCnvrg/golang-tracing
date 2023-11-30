@@ -27,6 +27,3 @@ spec:
                   fieldPath: status.hostIP
             - name: traces-collector-addr
               value: $(NODE_IP):4317
-#            - name: NODE_IP
-#              valueFrom:
-#                fieldRef: status.hostIP

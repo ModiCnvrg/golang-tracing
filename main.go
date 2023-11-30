@@ -9,10 +9,14 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel"
+	otel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
+	"go.opentelemetry.io/otel/metric"
 	_ "go.opentelemetry.io/otel/propagation"
+	sdkmetrics "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
@@ -42,16 +46,18 @@ func getEnv(key, fallback string) string {
 
 func main() {
 	ctx := context.Background()
+	initMetrics()
 	go serviceA(ctx, 8081)
-	go func() {
-		for {
-			ctx, span := otel.Tracer("myTracer").Start(ctx, "")
-			time.Sleep(2 * time.Second)
-			log := logging.NewLogrus(ctx)
-			log.Info("just printing")
-			span.End()
-		}
-	}()
+
+	//go func() {
+	//	for {
+	//		ctx, span := otel.Tracer("myTracer").Start(ctx, "")
+	//		time.Sleep(2 * time.Second)
+	//		log := logging.NewLogrus(ctx)
+	//		log.Info("just printing")
+	//		span.End()
+	//	}
+	//}()
 	serviceB(ctx, 8082)
 }
 
@@ -64,7 +70,7 @@ func serviceA(ctx context.Context, port int) {
 	if err != nil {
 		panic(err)
 	}
-	r.Use(otelgin.Middleware("service A", otelgin.WithTracerProvider(tp)))
+	r.Use(otelgin.Middleware("service A", otelgin.WithTracerProvider(tp)), RequestDurationMiddleware())
 	r.GET("/serviceA", serviceA_HttpHandler)
 	fmt.Println("serviceA listening on", r.BasePath())
 	host := "0.0.0.0"
@@ -151,6 +157,103 @@ func serviceB_HttpHandler(c *gin.Context) {
 	answer := add(ctx, 42, 1813)
 	c.Writer.Header().Add("SVC-RESPONSE", fmt.Sprint(answer))
 	log.Info("hello from serviceB: Answer is: %d", answer)
+}
+
+func initMetrics() {
+	ctx := context.Background()
+
+	metricsCollectorEndpoint := getEnv("traces-collector-addr", "ingress.coralogix.us:443")
+
+	// requires import: "go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
+	stdoutexporter, err := stdoutmetric.New()
+	if err != nil {
+		log.Fatalf("failed to create metrics exporter: %v", err)
+	}
+
+	stdoutreader := sdkmetrics.NewPeriodicReader(stdoutexporter)
+	// 1. define metrics connection options
+
+	metricsConnOpts := []otlpmetricgrpc.Option{
+		otlpmetricgrpc.WithTimeout(1 * time.Second),
+		otlpmetricgrpc.WithEndpoint(metricsCollectorEndpoint),
+	}
+
+	if token := getEnv("CX_TOKEN", ""); token != "" {
+		var headers = map[string]string{
+			"Authorization": "Bearer " + os.Getenv("CX_TOKEN"),
+		}
+		metricsConnOpts = append(metricsConnOpts, otlpmetricgrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})), otlpmetricgrpc.WithHeaders(headers))
+	} else {
+		metricsConnOpts = append(metricsConnOpts, otlpmetricgrpc.WithInsecure())
+	}
+
+	// 2. set up a metrics exporter
+	metricsExporter, err := otlpmetricgrpc.New(ctx, metricsConnOpts...)
+	if err != nil {
+		log.Fatalf("failed to create metrics exporter: %v", err)
+	}
+	reader := sdkmetrics.NewPeriodicReader(metricsExporter)
+	// 3. create a controller
+	// 3. define resource attributes,
+	// these resource attributes will be added to all metrics
+	resource := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String("go-manual-instro-traces-example"),
+		// cx.application.name and cx.subsystem.name are required for the
+		// metrics being sent to the coralogix platform
+		attribute.String("cx.application.name", cxApplicationName),
+		attribute.String("cx.subsystem.name", cxSubsystemName),
+	)
+
+	if err != nil {
+		log.Fatalf("failed to create metrics exporter: %v", err)
+	}
+
+	// 4. create batch metrics processor
+	//      Note: MetricsProcessor is a processing pipeline for metrics in the metrics signal.
+	//      MetricsProcessors registered with a MeterProvider and are called at the start and end of a
+	//      Metric's lifecycle, and are called in the order they are registered.
+	//      https://pkg.go.dev/go.opentelemetry.io/otel/sdk/metric#MetricsProcessor
+	mp := sdkmetrics.NewMeterProvider(
+		sdkmetrics.WithResource(resource),
+		sdkmetrics.WithReader(reader),       // <----
+		sdkmetrics.WithReader(stdoutreader), // <----
+	)
+	// 5. set the global meter provider
+	otel.SetMeterProvider(mp)
+}
+
+func RequestDurationMiddleware() gin.HandlerFunc {
+	// define a meter
+	meter := otel.Meter("goapp")
+	// Create two synchronous instruments: counter and histogram
+	reqCounter, err := meter.Int64Counter(
+		"http.request.counter",
+		metric.WithDescription("HTTP Request counter"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return func(c *gin.Context) {
+		ctx := c.Request.Context()
+		start := time.Now()
+
+		// Call the next handler in the chain.
+		c.Next()
+
+		// Calculate request duration.
+		duration := time.Since(start)
+
+		// Obtain the current span from the context.
+		span := trace.SpanFromContext(ctx)
+
+		// Add the duration as an attribute to the span.
+		span.SetAttributes(attribute.Int64("request.duration.ms", duration.Milliseconds()))
+
+		// You can also send the duration as a separate metric.
+		reqCounter.Add(ctx, 1)
+
+	}
 }
 
 func setupTracing(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
