@@ -1,10 +1,25 @@
 global:
   domain: "coralogix.us"
-  clusterName: "aks-cicd-2568"
-  defaultApplicationName: "aks-cicd-2568-defaultApplicationName"
-  defaultSubsystemName: "aks-cicd-2568-defaultSubsystemName"
+  clusterName: "aks-cicd-2600"
   logLevel: "info"
 
   extensions:
     kubernetesDashboard:
       enabled: true
+
+opentelemetry-agent:
+  config:
+    processors:
+      filter/filter_log:
+        logs:
+          exclude:
+            match_type: regexp
+            record_attributes:
+              - key: msg
+                value: just.*
+    service:
+      pipelines:
+        logs:
+          processors:
+            - filter/filter_log
+            - batch

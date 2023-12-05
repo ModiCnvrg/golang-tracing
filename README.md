@@ -6,6 +6,7 @@ kubectl create secret generic coralogix-keys \
 
 # Helm
 helm repo add coralogix https://cgx.jfrog.io/artifactory/coralogix-charts-virtual
+kubectl create namespace monitoring
 kubectl create secret generic coralogix-keys --from-literal=PRIVATE_KEY="" -n monitoring
 helm upgrade --install otel-coralogix-integration coralogix/otel-integration --render-subchart-notes --create-namespace -n monitoring -f 
 

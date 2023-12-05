@@ -13,10 +13,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
 	"go.opentelemetry.io/otel/metric"
 	_ "go.opentelemetry.io/otel/propagation"
-	sdkmetrics "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
@@ -46,7 +44,20 @@ func getEnv(key, fallback string) string {
 
 func main() {
 	ctx := context.Background()
-	initMetrics()
+	config := &MetricsConfig{}
+	WithLabels(attribute.String("key1", "value1"),
+		attribute.String("key2", "value2"),
+		semconv.ServiceNameKey.String("go-manual-instro-traces-example"),
+		attribute.String("cx.application.name", cxApplicationName),
+		attribute.String("cx.subsystem.name", cxSubsystemName))(config)
+	WithExporterOpts(otlpmetricgrpc.WithTimeout(1*time.Second),
+		otlpmetricgrpc.WithEndpoint(getEnv("traces-collector-addr", "ingress.coralogix.us:443")),
+		otlpmetricgrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})),
+		otlpmetricgrpc.WithHeaders(map[string]string{
+			"Authorization": "Bearer " + getEnv("CX_TOKEN", ""),
+		}))(config)
+
+	initGrpcMetrics(ctx, *config)
 	go serviceA(ctx, 8081)
 
 	//go func() {
@@ -159,70 +170,6 @@ func serviceB_HttpHandler(c *gin.Context) {
 	log.Info("hello from serviceB: Answer is: %d", answer)
 }
 
-func initMetrics() {
-	ctx := context.Background()
-
-	metricsCollectorEndpoint := getEnv("traces-collector-addr", "ingress.coralogix.us:443")
-
-	// requires import: "go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
-	stdoutexporter, err := stdoutmetric.New()
-	if err != nil {
-		log.Fatalf("failed to create metrics exporter: %v", err)
-	}
-
-	stdoutreader := sdkmetrics.NewPeriodicReader(stdoutexporter)
-	// 1. define metrics connection options
-
-	metricsConnOpts := []otlpmetricgrpc.Option{
-		otlpmetricgrpc.WithTimeout(1 * time.Second),
-		otlpmetricgrpc.WithEndpoint(metricsCollectorEndpoint),
-	}
-
-	if token := getEnv("CX_TOKEN", ""); token != "" {
-		var headers = map[string]string{
-			"Authorization": "Bearer " + os.Getenv("CX_TOKEN"),
-		}
-		metricsConnOpts = append(metricsConnOpts, otlpmetricgrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})), otlpmetricgrpc.WithHeaders(headers))
-	} else {
-		metricsConnOpts = append(metricsConnOpts, otlpmetricgrpc.WithInsecure())
-	}
-
-	// 2. set up a metrics exporter
-	metricsExporter, err := otlpmetricgrpc.New(ctx, metricsConnOpts...)
-	if err != nil {
-		log.Fatalf("failed to create metrics exporter: %v", err)
-	}
-	reader := sdkmetrics.NewPeriodicReader(metricsExporter)
-	// 3. create a controller
-	// 3. define resource attributes,
-	// these resource attributes will be added to all metrics
-	resource := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceNameKey.String("go-manual-instro-traces-example"),
-		// cx.application.name and cx.subsystem.name are required for the
-		// metrics being sent to the coralogix platform
-		attribute.String("cx.application.name", cxApplicationName),
-		attribute.String("cx.subsystem.name", cxSubsystemName),
-	)
-
-	if err != nil {
-		log.Fatalf("failed to create metrics exporter: %v", err)
-	}
-
-	// 4. create batch metrics processor
-	//      Note: MetricsProcessor is a processing pipeline for metrics in the metrics signal.
-	//      MetricsProcessors registered with a MeterProvider and are called at the start and end of a
-	//      Metric's lifecycle, and are called in the order they are registered.
-	//      https://pkg.go.dev/go.opentelemetry.io/otel/sdk/metric#MetricsProcessor
-	mp := sdkmetrics.NewMeterProvider(
-		sdkmetrics.WithResource(resource),
-		sdkmetrics.WithReader(reader),       // <----
-		sdkmetrics.WithReader(stdoutreader), // <----
-	)
-	// 5. set the global meter provider
-	otel.SetMeterProvider(mp)
-}
-
 func RequestDurationMiddleware() gin.HandlerFunc {
 	// define a meter
 	meter := otel.Meter("goapp")
@@ -298,7 +245,7 @@ func setupTracing(ctx context.Context, serviceName string) (*sdktrace.TracerProv
 	//      SpanProcessors registered with a TracerProvider and are called at the start and end of a
 	//      Span's lifecycle, and are called in the order they are registered.
 	//      https://pkg.go.dev/go.opentelemetry.io/otel/sdk/trace#SpanProcessor
-	sp := sdktrace.NewSimpleSpanProcessor(exporter)
+	sp := sdktrace.NewBatchSpanProcessor(exporter)
 
 	// 5. add span processor and resource attributes to the trace provider
 	tp := sdktrace.NewTracerProvider(
