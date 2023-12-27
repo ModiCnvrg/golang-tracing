@@ -1,6 +1,6 @@
 global:
   domain: "coralogix.us"
-  clusterName: "aks-cicd-2600"
+  clusterName: "aks-cicd-2764"
   logLevel: "info"
 
   extensions:

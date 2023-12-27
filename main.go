@@ -5,22 +5,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"github.com/AccessibleAI/observability/pkg/metering"
+	"github.com/AccessibleAI/observability/pkg/trace"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	otel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/metric"
 	_ "go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
-	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc/credentials"
-	"log"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"opetelemetry-and-go/logging"
 	"os"
 	"time"
@@ -44,20 +39,9 @@ func getEnv(key, fallback string) string {
 
 func main() {
 	ctx := context.Background()
-	config := &MetricsConfig{}
-	WithLabels(attribute.String("key1", "value1"),
-		attribute.String("key2", "value2"),
-		semconv.ServiceNameKey.String("go-manual-instro-traces-example"),
-		attribute.String("cx.application.name", cxApplicationName),
-		attribute.String("cx.subsystem.name", cxSubsystemName))(config)
-	WithExporterOpts(otlpmetricgrpc.WithTimeout(1*time.Second),
-		otlpmetricgrpc.WithEndpoint(getEnv("traces-collector-addr", "ingress.coralogix.us:443")),
-		otlpmetricgrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})),
-		otlpmetricgrpc.WithHeaders(map[string]string{
-			"Authorization": "Bearer " + getEnv("CX_TOKEN", ""),
-		}))(config)
+	tracesCollectorEndpoint := getEnv("traces-collector-addr", "nil")
 
-	initGrpcMetrics(ctx, *config)
+	metering.InitGrpcMetricsProvider(ctx, tracesCollectorEndpoint, "a"+cxApplicationName, "a"+cxSubsystemName)
 	go serviceA(ctx, 8081)
 
 	//go func() {
@@ -75,9 +59,9 @@ func main() {
 // curl -vkL http://127.0.0.1:8081/serviceA
 func serviceA(ctx context.Context, port int) {
 	r := gin.New()
-	var tp trace.TracerProvider
+	var tp oteltrace.TracerProvider
 	var err error
-	tp, err = setupTracing(ctx, "Service A Trace Provider")
+	err = setupTracing(ctx, "Service A Trace Provider")
 	if err != nil {
 		panic(err)
 	}
@@ -115,9 +99,9 @@ func serviceA_HttpHandler(c *gin.Context) {
 
 func serviceB(ctx context.Context, port int) {
 	r := gin.New()
-	var tp trace.TracerProvider
+	var tp oteltrace.TracerProvider
 	var err error
-	tp, err = setupTracing(ctx, "Service A Trace Provider")
+	err = setupTracing(ctx, "Service A Trace Provider")
 	if err != nil {
 		panic(err)
 	}
@@ -150,9 +134,9 @@ func serviceB_HttpHandler(c *gin.Context) {
 			ctx,
 			"add",
 			// add labels/tags/resources(if any) that are specific to this scope.
-			trace.WithAttributes(attribute.String("component", "addition")),
-			trace.WithAttributes(attribute.String("someKey", "someValue")),
-			trace.WithAttributes(attribute.Int("age", 89)),
+			oteltrace.WithAttributes(attribute.String("component", "addition")),
+			oteltrace.WithAttributes(attribute.String("someKey", "someValue")),
+			oteltrace.WithAttributes(attribute.Int("age", 89)),
 		)
 		defer span.End()
 
@@ -192,7 +176,7 @@ func RequestDurationMiddleware() gin.HandlerFunc {
 		duration := time.Since(start)
 
 		// Obtain the current span from the context.
-		span := trace.SpanFromContext(ctx)
+		span := oteltrace.SpanFromContext(ctx)
 
 		// Add the duration as an attribute to the span.
 		span.SetAttributes(attribute.Int64("request.duration.ms", duration.Milliseconds()))
@@ -203,59 +187,10 @@ func RequestDurationMiddleware() gin.HandlerFunc {
 	}
 }
 
-func setupTracing(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
-	// 1. define trace connection options
-
-	tracesCollectorEndpoint := getEnv("traces-collector-addr", "ingress.coralogix.us:443")
-
-	traceConnOpts := []otlptracegrpc.Option{
-		otlptracegrpc.WithTimeout(1 * time.Second),
-		otlptracegrpc.WithEndpoint(tracesCollectorEndpoint),
-	}
-
-	if token := getEnv("CX_TOKEN", ""); token != "" {
-		var headers = map[string]string{
-			"Authorization": "Bearer " + os.Getenv("CX_TOKEN"),
-		}
-		traceConnOpts = append(traceConnOpts, otlptracegrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})), otlptracegrpc.WithHeaders(headers))
-	} else {
-		traceConnOpts = append(traceConnOpts, otlptracegrpc.WithInsecure())
-	}
-
-	// 2. set up a trace exporter
-	exporter, err := otlptracegrpc.New(ctx, traceConnOpts...)
-	if err != nil {
-		log.Fatalf("failed to create trace exporter: %v", err)
-	}
-
-	// 3 define span resource attributes,
-	// these resource attributes will be added to all Spans
-	resource := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceNameKey.String("go-manual-instro-traces-example"),
-
-		// cx.application.name and cx.subsystem.name are required for the
-		// spans being sent to the coralogix platform
-		attribute.String("cx.application.name", cxApplicationName),
-		attribute.String("cx.subsystem.name", cxSubsystemName),
-	)
-
-	// 4. create batch span processor
-	//      Note: SpanProcessor is a processing pipeline for spans in the trace signal.
-	//      SpanProcessors registered with a TracerProvider and are called at the start and end of a
-	//      Span's lifecycle, and are called in the order they are registered.
-	//      https://pkg.go.dev/go.opentelemetry.io/otel/sdk/trace#SpanProcessor
-	sp := sdktrace.NewBatchSpanProcessor(exporter)
-
-	// 5. add span processor and resource attributes to the trace provider
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithResource(resource),
-		sdktrace.WithSpanProcessor(sp),
-	)
-
-	// 6. set the global trace provider
-	otel.SetTracerProvider(tp)
-	return tp, nil
+func setupTracing(ctx context.Context, serviceName string) error {
+	tracesCollectorEndpoint := getEnv("traces-collector-addr", "")
+	trace.InitGrpcTraceProvider(ctx, tracesCollectorEndpoint, "a"+cxApplicationName, "a"+cxSubsystemName)
+	return nil
 }
 
 // getTls returns a configuration that enables the use of mutual TLS.
